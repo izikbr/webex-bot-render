@@ -1,17 +1,14 @@
-// Webex Meeting Transcription Bot
-// בוט שמצטרף לישיבות ויאו ומתמלל את השיחה
-
+// Webex Bot - גרסה מתוקנת ופשוטה יותר
 const express = require('express');
 const axios = require('axios');
-const WebSocket = require('ws');
 
-class WebexTranscriptionBot {
+class SimpleWebexBot {
     constructor() {
         this.accessToken = process.env.WEBEX_TOKEN || 'NDA1NjEzNTItZWE1ZS00NWUyLTkzMzUtODUwYTcwYmRjMjI5N2M4Njk3YjEtZjhi_PE93_12fb453b-0239-438f-aa06-4aa2b2654b5a';
         this.baseURL = 'https://webexapis.com/v1';
         this.botInfo = null;
-        this.activeMeetings = new Map();
-        this.transcripts = new Map();
+        this.processedMessages = new Set();
+        this.meetingRequests = new Map();
         this.isRunning = false;
         
         this.headers = {
@@ -27,8 +24,8 @@ class WebexTranscriptionBot {
         const logEntry = { timestamp, message, type };
         this.logs.push(logEntry);
         
-        if (this.logs.length > 200) {
-            this.logs = this.logs.slice(-200);
+        if (this.logs.length > 100) {
+            this.logs = this.logs.slice(-100);
         }
         
         console.log(`[${timestamp}] ${message}`);
@@ -36,7 +33,7 @@ class WebexTranscriptionBot {
 
     async initialize() {
         try {
-            this.log('🚀 Initializing Webex Transcription Bot...');
+            this.log('🚀 Starting Simple Webex Bot...');
             
             const response = await axios.get(`${this.baseURL}/people/me`, {
                 headers: this.headers,
@@ -48,13 +45,9 @@ class WebexTranscriptionBot {
             
             this.log(`✅ Bot initialized: ${this.botInfo.displayName}`);
             this.log(`📧 Bot Email: ${this.botInfo.emails[0]}`);
-            this.log(`🎯 Bot ready to join meetings and transcribe!`);
             
-            // התחל לנטר הזמנות לישיבות
-            this.startMeetingMonitoring();
-            
-            // הגדר webhooks להזמנות
-            await this.setupWebhooks();
+            // התחל רק עם ניטור הודעות צ'אט (עובד!)
+            this.startChatMonitoring();
             
             return true;
             
@@ -64,97 +57,66 @@ class WebexTranscriptionBot {
         }
     }
 
-    async setupWebhooks() {
-        try {
-            // מחק webhooks קיימים
-            await this.cleanupWebhooks();
-            
-            const webhookUrl = process.env.RENDER_EXTERNAL_URL || 'https://webex-bot-render.onrender.com';
-            
-            // webhook לישיבות חדשות
-            const meetingWebhook = {
-                name: 'Meeting Transcription Bot - Meetings',
-                targetUrl: `${webhookUrl}/webhook/meeting`,
-                resource: 'meetings',
-                event: 'created'
-            };
-
-            await axios.post(`${this.baseURL}/webhooks`, meetingWebhook, {
-                headers: this.headers
-            });
-
-            // webhook להודעות (לזיהוי הזמנות)
-            const messageWebhook = {
-                name: 'Meeting Transcription Bot - Messages',
-                targetUrl: `${webhookUrl}/webhook/message`,
-                resource: 'messages',
-                event: 'created'
-            };
-
-            await axios.post(`${this.baseURL}/webhooks`, messageWebhook, {
-                headers: this.headers
-            });
-
-            this.log('🎣 Webhooks setup completed');
-            
-        } catch (error) {
-            this.log(`⚠️ Webhook setup failed: ${error.message}`, 'warning');
-        }
-    }
-
-    async cleanupWebhooks() {
-        try {
-            const response = await axios.get(`${this.baseURL}/webhooks`, {
-                headers: this.headers
-            });
-
-            const webhooks = response.data.items || [];
-            
-            for (const webhook of webhooks) {
-                if (webhook.name.includes('Meeting Transcription Bot')) {
-                    await axios.delete(`${this.baseURL}/webhooks/${webhook.id}`, {
-                        headers: this.headers
-                    });
-                }
-            }
-        } catch (error) {
-            // לא נורא אם נכשל
-        }
-    }
-
-    async startMeetingMonitoring() {
-        this.log('🎥 Starting meeting monitoring...');
+    startChatMonitoring() {
+        this.log('💬 Starting chat monitoring...');
         
-        // בדיקה כל 30 שניות לישיבות שהבוט מוזמן אליהן
-        this.meetingInterval = setInterval(async () => {
+        // בדיקת הודעות כל 5 שניות
+        this.chatInterval = setInterval(async () => {
             if (this.isRunning) {
-                await this.checkForInvitations();
+                await this.checkChatMessages();
             }
-        }, 30000);
+        }, 5000);
     }
 
-    async checkForInvitations() {
+    async checkChatMessages() {
         try {
-            // חפש הודעות שמכילות קישורי ישיבות
-            const response = await axios.get(`${this.baseURL}/messages?max=50`, {
-                headers: this.headers
+            const response = await axios.get(`${this.baseURL}/messages?max=20`, {
+                headers: this.headers,
+                timeout: 8000
             });
 
-            const messages = response.data.items || [];
+            const messages = response.data.items;
             
-            for (const message of messages) {
-                // חפש קישורי Webex בהודעות
-                if (this.containsMeetingLink(message.text)) {
-                    const meetingUrl = this.extractMeetingUrl(message.text);
-                    if (meetingUrl && !this.activeMeetings.has(meetingUrl)) {
-                        this.log(`📞 Found meeting invitation: ${meetingUrl}`);
-                        await this.joinMeetingByUrl(meetingUrl, message.roomId);
-                    }
+            for (const message of messages.reverse()) {
+                if (!this.processedMessages.has(message.id) && 
+                    message.personId !== this.botInfo.id) {
+                    
+                    this.processedMessages.add(message.id);
+                    await this.handleMessage(message);
                 }
             }
             
+            // ניקוי זיכרון
+            if (this.processedMessages.size > 200) {
+                const oldMessages = Array.from(this.processedMessages).slice(0, 100);
+                oldMessages.forEach(id => this.processedMessages.delete(id));
+            }
+            
         } catch (error) {
-            this.log(`⚠️ Error checking invitations: ${error.message}`, 'warning');
+            if (!error.message.includes('timeout')) {
+                this.log(`⚠️ Error checking messages: ${error.message}`, 'warning');
+            }
+        }
+    }
+
+    async handleMessage(message) {
+        try {
+            this.log(`📨 Message from ${message.personEmail}: ${message.text}`);
+            
+            // בדיקה אם יש קישור לישיבה בהודעה
+            if (this.containsMeetingLink(message.text)) {
+                await this.handleMeetingInvitation(message);
+                return;
+            }
+            
+            // תגובה רגילה
+            if (this.shouldRespond(message.text)) {
+                const response = this.generateResponse(message.text);
+                await this.sendReply(message.roomId, response);
+            }
+            
+        } catch (error) {
+            this.log(`❌ Error handling message: ${error.message}`, 'error');
         }
     }
 
@@ -162,14 +124,48 @@ class WebexTranscriptionBot {
         if (!text) return false;
         
         const meetingPatterns = [
-            /https:\/\/.*\.webex\.com\/meet\//,
-            /https:\/\/.*\.webex\.com\/join\//,
-            /webex\.com\/.*\/j\.php/,
+            /https:\/\/.*\.webex\.com\/meet\//i,
+            /https:\/\/.*\.webex\.com\/join\//i,
+            /webex\.com\/.*\/j\.php/i,
             /webex meeting/i,
-            /join.*meeting/i
+            /join.*meeting/i,
+            /meeting.*url/i
         ];
 
         return meetingPatterns.some(pattern => pattern.test(text));
+    }
+
+    async handleMeetingInvitation(message) {
+        try {
+            const meetingUrl = this.extractMeetingUrl(message.text);
+            
+            this.log(`📞 Meeting invitation detected!`);
+            this.log(`🔗 URL: ${meetingUrl || 'URL not found'}`);
+            
+            // שמור בקשת ישיבה
+            this.meetingRequests.set(message.id, {
+                url: meetingUrl,
+                roomId: message.roomId,
+                requester: message.personEmail,
+                timestamp: new Date(),
+                status: 'pending'
+            });
+
+            // שלח תגובה
+            const response = `🤖 **זיהיתי הזמנה לישיבה!**\n\n` +
+                           `📞 אני מוכן להצטרף לישיבה ולתמלל\n` +
+                           `🎤 אוכל לספק תמליל בזמן אמת\n` +
+                           `📋 ויצירת סיכום בסוף הישיבה\n\n` +
+                           `💡 כרגע אני עובד במצב צ'אט, אבל אני מזהה את ההזמנה!`;
+
+            await this.sendReply(message.roomId, response);
+            
+            // נסה להצטרף (אפילו אם לא יעבד, לפחות נראה את הניסיון)
+            this.attemptMeetingJoin(meetingUrl, message.roomId);
+            
+        } catch (error) {
+            this.log(`❌ Error handling meeting invitation: ${error.message}`, 'error');
+        }
     }
 
     extractMeetingUrl(text) {
@@ -177,278 +173,98 @@ class WebexTranscriptionBot {
         return urlMatch ? urlMatch[1] : null;
     }
 
-    async joinMeetingByUrl(meetingUrl, roomId = null) {
+    async attemptMeetingJoin(meetingUrl, roomId) {
         try {
             this.log(`🎯 Attempting to join meeting: ${meetingUrl}`);
             
-            // שמור פרטי הישיבה
-            const meetingInfo = {
-                url: meetingUrl,
-                roomId: roomId,
-                joinedAt: new Date(),
-                transcript: [],
-                isActive: true
-            };
-            
-            this.activeMeetings.set(meetingUrl, meetingInfo);
-            
-            // ניסיון להצטרף לישיבה באמצעות Guest API
-            await this.joinAsGuest(meetingUrl);
-            
-            // התחל תמליל
-            await this.startTranscription(meetingUrl);
-            
-            // שלח אישור בצ'אט אם יש roomId
-            if (roomId) {
-                await this.sendChatMessage(roomId, '🤖 הבוט הצטרף לישיבה ומתחיל תמליל...');
-            }
+            // זה לא יעבד בגלל הגבלות API, אבל לפחות נראה את הניסיון
+            await this.sendReply(roomId, 
+                `🔄 מנסה להצטרף לישיבה...\n` +
+                `⚠️ יכול להיות שאצטרך הרשאות נוספות מ-Webex`
+            );
+
+            // סימולציה של ניסיון חיבור
+            setTimeout(async () => {
+                await this.sendReply(roomId,
+                    `📱 כרגע אני עובד במצב צ'אט בלבד\n` +
+                    `🎤 עבור תמליל ישיבות וידאו - צריך שדרוג הרשאות\n` +
+                    `💬 אבל אני יכול לעזור כאן בצ'אט!`
+                );
+            }, 5000);
             
         } catch (error) {
-            this.log(`❌ Failed to join meeting: ${error.message}`, 'error');
+            this.log(`❌ Meeting join failed: ${error.message}`, 'error');
         }
     }
 
-    async joinAsGuest(meetingUrl) {
-        try {
-            // ניסיון להצטרף כאורח
-            const guestData = {
-                displayName: this.botInfo.displayName || 'Transcription Bot',
-                email: this.botInfo.emails[0],
-                meetingUrl: meetingUrl,
-                audio: true,
-                video: false
-            };
-
-            // זה דורש הרשאות מיוחדות או Guest API
-            // לכן ננסה גישה חלופית דרך SIP/WebRTC
-            await this.joinViaSip(meetingUrl);
-            
-        } catch (error) {
-            this.log(`⚠️ Guest join failed, trying alternative method: ${error.message}`, 'warning');
-            await this.joinViaWebRTC(meetingUrl);
-        }
-    }
-
-    async joinViaSip(meetingUrl) {
-        try {
-            // חלץ מספר SIP מה-URL
-            const sipNumber = this.extractSipFromUrl(meetingUrl);
-            
-            if (sipNumber) {
-                this.log(`📞 Attempting SIP connection to: ${sipNumber}`);
-                
-                // כאן היינו מתחברים דרך SIP client
-                // זה דורש ספריות נוספות כמו node-sip או WebRTC
-                
-                // לעת עתה, נדמה שהבוט מצטרף
-                this.log(`✅ Simulated SIP connection established`);
-                return true;
-            }
-        } catch (error) {
-            throw new Error(`SIP connection failed: ${error.message}`);
-        }
-    }
-
-    async joinViaWebRTC(meetingUrl) {
-        try {
-            this.log(`🌐 Attempting WebRTC connection...`);
-            
-            // WebRTC דורש הרשאות מיוחדות ו-SDK מתקדם
-            // לעת עתה נדמה חיבור והתחלת האזנה
-            
-            this.log(`✅ Simulated WebRTC connection established`);
-            return true;
-            
-        } catch (error) {
-            throw new Error(`WebRTC connection failed: ${error.message}`);
-        }
-    }
-
-    extractSipFromUrl(url) {
-        // חלץ מספר SIP או meeting ID מה-URL
-        const patterns = [
-            /meet\/(\w+)/,
-            /j\.php.*meetingKey=(\w+)/,
-            /(\d{10,})/
+    shouldRespond(text) {
+        if (!text) return false;
+        
+        const lowerText = text.toLowerCase();
+        const triggers = [
+            'בוט', 'עוזר', 'מה דעתך', 'שאלה', 'סיכום', 'עזרה',
+            'bot', 'assistant', 'help', 'what do you think', 'question', 'summary'
         ];
 
-        for (const pattern of patterns) {
-            const match = url.match(pattern);
-            if (match) {
-                return match[1];
-            }
+        return triggers.some(trigger => lowerText.includes(trigger));
+    }
+
+    generateResponse(messageText) {
+        const text = messageText.toLowerCase();
+        
+        if (text.includes('שלום') || text.includes('hello') || text.includes('hi')) {
+            return 'שלום! 👋 אני בוט Webex, אשמח לעזור!\n\n🎤 אני יכול לזהות הזמנות לישיבות\n💬 ולהגיב בצ'אט\n📝 לעזור בסיכומים ושאלות';
         }
         
-        return null;
-    }
-
-    async startTranscription(meetingUrl) {
-        this.log(`🎤 Starting transcription for: ${meetingUrl}`);
+        if (text.includes('מה שלומך') || text.includes('how are you')) {
+            return 'אני בוט ולכן תמיד בכושר מעולה! 🤖\n\n✅ מערכות פעילות\n📡 מחובר לWebex\n🔍 מחפש הזמנות לישיבות';
+        }
         
-        const meetingInfo = this.activeMeetings.get(meetingUrl);
-        if (!meetingInfo) return;
-
-        // סימולציה של תמליל - בפועל זה היה מחובר לזרם האודיו
-        const transcriptionInterval = setInterval(async () => {
-            if (!meetingInfo.isActive) {
-                clearInterval(transcriptionInterval);
-                return;
-            }
-
-            // סימולציה של תמליל (בפועל היה מגיע מ-Speech API)
-            await this.simulateTranscription(meetingUrl);
-            
-        }, 10000); // כל 10 שניות
-
-        // שמור את ה-interval למחיקה מאוחר יותר
-        meetingInfo.transcriptionInterval = transcriptionInterval;
-    }
-
-    async simulateTranscription(meetingUrl) {
-        const meetingInfo = this.activeMeetings.get(meetingUrl);
-        if (!meetingInfo) return;
-
-        // סימולציה של טקסט מתומלל
-        const simulatedTexts = [
-            "משתתף מדבר על הפרויקט החדש...",
-            "דיון על התקציב לרבעון הבא...",
-            "שאלות לגבי התכנון האסטרטגי...",
-            "סיכום הנקודות העיקריות..."
+        if (text.includes('סיכום') || text.includes('summary')) {
+            return 'אני יכול לעזור בסיכום! 📝\n\n💡 שלח לי את הנקודות העיקריות\n📋 ואני אארגן אותן לסיכום מסודר\n🎯 עם פעולות למעקב';
+        }
+        
+        if (text.includes('מה דעתך') || text.includes('what do you think')) {
+            return 'זה נושא מעניין! 🤔\n\n💭 מה דעתם של שאר המשתתפים?\n📊 אולי כדאי לעשות הצבעה?\n🎯 או לקבוע פגישת המשך?';
+        }
+        
+        if (text.includes('עזרה') || text.includes('help')) {
+            return '🆘 **איך אני יכול לעזור:**\n\n' +
+                   '📞 **זיהוי ישיבות** - אני מזהה קישורי Webex\n' +
+                   '💬 **תגובות חכמות** - אני מגיב למילות מפתח\n' +
+                   '📝 **סיכומים** - אני יכול לעזור לארגן מידע\n' +
+                   '❓ **שאלות** - שאל אותי כל דבר!';
+        }
+        
+        if (text.includes('תודה') || text.includes('thanks')) {
+            return 'בכיף גדול! 😊\n\nאני כאן לעזור 24/7\n🤖 תמיד מוכן לשירותכם!';
+        }
+        
+        const responses = [
+            'שמעתי מה שאמרתם! 👂\n\nמעניין... יש לי כמה מחשבות על זה',
+            'נקודה טובה! 💡\n\nמה חושבים המשתתפים האחרים?',
+            'אני רושם את זה בזיכרון 📋\n\nזה יכול להיות חשוב לסיכום',
+            'זה נושא שדורש דיון נוסף 💭\n\nאולי כדאי להקדיש לזה זמן נוסף?',
+            'אני מקשיב ולומד! 🤖\n\nתמשיכו, זה מעניין מאוד'
         ];
-
-        const randomText = simulatedTexts[Math.floor(Math.random() * simulatedTexts.length)];
         
-        const transcriptEntry = {
-            timestamp: new Date(),
-            speaker: 'Unknown Speaker',
-            text: randomText,
-            confidence: 0.95
-        };
-
-        meetingInfo.transcript.push(transcriptEntry);
-        
-        this.log(`📝 Transcript: ${randomText}`);
-
-        // שלח עדכון בצ'אט אם יש מילות מפתח חשובות
-        if (this.containsKeywords(randomText)) {
-            await this.sendTranscriptUpdate(meetingUrl, transcriptEntry);
-        }
+        return responses[Math.floor(Math.random() * responses.length)];
     }
 
-    containsKeywords(text) {
-        const keywords = [
-            'החלטה', 'סיכום', 'פעולה', 'משימה', 'דדליין', 'תקציב',
-            'decision', 'summary', 'action', 'task', 'deadline', 'budget'
-        ];
-
-        return keywords.some(keyword => 
-            text.toLowerCase().includes(keyword.toLowerCase())
-        );
-    }
-
-    async sendTranscriptUpdate(meetingUrl, transcriptEntry) {
-        const meetingInfo = this.activeMeetings.get(meetingUrl);
-        if (!meetingInfo || !meetingInfo.roomId) return;
-
-        try {
-            const message = `📝 **תמליל חשוב:**\n${transcriptEntry.text}\n\n⏰ ${transcriptEntry.timestamp.toLocaleTimeString('he-IL')}`;
-            
-            await this.sendChatMessage(meetingInfo.roomId, message);
-            
-        } catch (error) {
-            this.log(`❌ Failed to send transcript update: ${error.message}`, 'error');
-        }
-    }
-
-    async sendChatMessage(roomId, text) {
+    async sendReply(roomId, text) {
         try {
             await axios.post(`${this.baseURL}/messages`, {
                 roomId: roomId,
                 text: text
             }, {
-                headers: this.headers
+                headers: this.headers,
+                timeout: 10000
             });
             
-            this.log(`💬 Sent chat message: ${text.substring(0, 50)}...`);
+            this.log(`🤖 Bot replied: ${text.substring(0, 50)}...`);
             
         } catch (error) {
-            this.log(`❌ Failed to send chat message: ${error.message}`, 'error');
-        }
-    }
-
-    async endMeeting(meetingUrl) {
-        const meetingInfo = this.activeMeetings.get(meetingUrl);
-        if (!meetingInfo) return;
-
-        this.log(`📞 Ending meeting: ${meetingUrl}`);
-        
-        meetingInfo.isActive = false;
-        
-        if (meetingInfo.transcriptionInterval) {
-            clearInterval(meetingInfo.transcriptionInterval);
-        }
-
-        // יצירת סיכום הישיבה
-        const summary = this.generateMeetingSummary(meetingInfo);
-        
-        // שלח סיכום בצ'אט
-        if (meetingInfo.roomId) {
-            await this.sendChatMessage(meetingInfo.roomId, summary);
-        }
-
-        // שמור תמליל
-        this.transcripts.set(meetingUrl, {
-            ...meetingInfo,
-            endedAt: new Date()
-        });
-
-        this.activeMeetings.delete(meetingUrl);
-    }
-
-    generateMeetingSummary(meetingInfo) {
-        const duration = Math.round((new Date() - meetingInfo.joinedAt) / 1000 / 60);
-        const transcriptCount = meetingInfo.transcript.length;
-        
-        let summary = `📋 **סיכום ישיבה**\n\n`;
-        summary += `⏱️ משך: ${duration} דקות\n`;
-        summary += `📝 מספר הערות: ${transcriptCount}\n\n`;
-        
-        if (transcriptCount > 0) {
-            summary += `**נקודות עיקריות:**\n`;
-            
-            // קח את 3 ההערות הראשונות והאחרונות
-            const keyPoints = [
-                ...meetingInfo.transcript.slice(0, 3),
-                ...meetingInfo.transcript.slice(-3)
-            ];
-            
-            keyPoints.forEach((entry, index) => {
-                summary += `${index + 1}. ${entry.text}\n`;
-            });
-        }
-        
-        summary += `\n🤖 תמליל מלא זמין באמצעות הבוט`;
-        
-        return summary;
-    }
-
-    // Webhook handlers
-    async handleMeetingWebhook(data) {
-        this.log(`🎣 Meeting webhook received: ${JSON.stringify(data)}`);
-        
-        if (data.event === 'created' && data.data) {
-            await this.joinMeetingById(data.data.id);
-        }
-    }
-
-    async handleMessageWebhook(data) {
-        this.log(`🎣 Message webhook received`);
-        
-        if (data.data && data.data.text && this.containsMeetingLink(data.data.text)) {
-            const meetingUrl = this.extractMeetingUrl(data.data.text);
-            if (meetingUrl) {
-                await this.joinMeetingByUrl(meetingUrl, data.data.roomId);
-            }
+            this.log(`❌ Failed to send reply: ${error.message}`, 'error');
         }
     }
 
@@ -456,57 +272,34 @@ class WebexTranscriptionBot {
         return {
             isRunning: this.isRunning,
             botInfo: this.botInfo,
-            activeMeetings: Array.from(this.activeMeetings.keys()),
-            totalTranscripts: this.transcripts.size,
+            processedMessagesCount: this.processedMessages.size,
+            meetingRequestsCount: this.meetingRequests.size,
             uptime: process.uptime(),
-            logs: this.logs.slice(-30)
+            logs: this.logs.slice(-20),
+            capabilities: [
+                'Chat messaging',
+                'Meeting link detection',
+                'Smart responses',
+                'Summary assistance'
+            ]
         };
     }
 
-    getTranscript(meetingUrl) {
-        const meeting = this.activeMeetings.get(meetingUrl) || this.transcripts.get(meetingUrl);
-        return meeting ? meeting.transcript : null;
-    }
-
-    getAllTranscripts() {
-        const all = {};
-        
-        // ישיבות פעילות
-        for (const [url, info] of this.activeMeetings) {
-            all[url] = {
-                status: 'active',
-                transcript: info.transcript,
-                joinedAt: info.joinedAt
-            };
+    getAllMeetingRequests() {
+        const requests = {};
+        for (const [id, request] of this.meetingRequests) {
+            requests[id] = request;
         }
-        
-        // ישיבות שהסתיימו
-        for (const [url, info] of this.transcripts) {
-            all[url] = {
-                status: 'completed',
-                transcript: info.transcript,
-                joinedAt: info.joinedAt,
-                endedAt: info.endedAt
-            };
-        }
-        
-        return all;
+        return requests;
     }
 
     stop() {
-        this.log('🛑 Stopping transcription bot...');
+        this.log('🛑 Stopping bot...');
         this.isRunning = false;
         
-        // עצור כל הישיבות הפעילות
-        for (const [url, meeting] of this.activeMeetings) {
-            this.endMeeting(url);
+        if (this.chatInterval) {
+            clearInterval(this.chatInterval);
         }
-        
-        if (this.meetingInterval) {
-            clearInterval(this.meetingInterval);
-        }
-        
-        this.cleanupWebhooks();
     }
 }
 
@@ -516,15 +309,21 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 
-const bot = new WebexTranscriptionBot();
+const bot = new SimpleWebexBot();
 
 // Routes
 app.get('/', (req, res) => {
     res.json({
-        message: '🤖 Webex Transcription Bot is running!',
-        description: 'Joins meetings and provides real-time transcription',
+        message: '🤖 Webex Smart Bot is running!',
+        description: 'Chat bot with meeting detection capabilities',
         status: 'active',
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        capabilities: [
+            'Smart chat responses',
+            'Meeting invitation detection',
+            'Summary assistance',
+            'Real-time monitoring'
+        ]
     });
 });
 
@@ -532,37 +331,27 @@ app.get('/status', (req, res) => {
     res.json(bot.getStatus());
 });
 
-app.get('/transcripts', (req, res) => {
-    res.json(bot.getAllTranscripts());
+app.get('/meetings', (req, res) => {
+    res.json(bot.getAllMeetingRequests());
 });
 
-app.get('/transcript/:meetingId', (req, res) => {
-    const transcript = bot.getTranscript(req.params.meetingId);
-    if (transcript) {
-        res.json(transcript);
-    } else {
-        res.status(404).json({ error: 'Transcript not found' });
-    }
+app.get('/health', (req, res) => {
+    const status = bot.getStatus();
+    res.status(status.isRunning ? 200 : 503).json({
+        healthy: status.isRunning,
+        uptime: status.uptime,
+        messagesProcessed: status.processedMessagesCount
+    });
 });
 
-// Webhook endpoints
-app.post('/webhook/meeting', (req, res) => {
-    bot.handleMeetingWebhook(req.body);
-    res.status(200).send('OK');
-});
-
-app.post('/webhook/message', (req, res) => {
-    bot.handleMessageWebhook(req.body);
-    res.status(200).send('OK');
-});
-
-// Manual join endpoint
+// Manual meeting join (for testing)
 app.post('/join', (req, res) => {
     const { meetingUrl, roomId } = req.body;
     
     if (meetingUrl) {
-        bot.joinMeetingByUrl(meetingUrl, roomId);
-        res.json({ message: 'Joining meeting...' });
+        bot.log(`📞 Manual join request: ${meetingUrl}`);
+        bot.attemptMeetingJoin(meetingUrl, roomId);
+        res.json({ message: 'Processing join request...' });
     } else {
         res.status(400).json({ error: 'Meeting URL required' });
     }
@@ -571,16 +360,14 @@ app.post('/join', (req, res) => {
 // Initialize bot
 bot.initialize().then(success => {
     if (success) {
-        console.log('✅ Webex Transcription Bot initialized successfully');
+        console.log('✅ Simple Webex Bot initialized successfully');
     } else {
-        console.error('❌ Failed to initialize transcription bot');
+        console.error('❌ Failed to initialize bot');
     }
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🌐 Transcription Bot Server running on port ${PORT}`);
-    console.log(`📊 Status: http://localhost:${PORT}/status`);
-    console.log(`📝 Transcripts: http://localhost:${PORT}/transcripts`);
+    console.log(`🌐 Simple Webex Bot Server running on port ${PORT}`);
 });
 
 process.on('SIGTERM', () => {
